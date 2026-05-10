@@ -1,13 +1,11 @@
 #include "Unit/UnitPool.hpp"
-#include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace luastg {
 	namespace {
-        constexpr double kPi = 3.141592653589793238462643383279502884;
-        constexpr double kRadToDeg = 180.0 / kPi;
-        constexpr double kUnitEpsilon = 1e-12;
+		constexpr double kPi = 3.141592653589793238462643383279502884;
+		constexpr double kRadToDeg = 180.0 / kPi;
+		constexpr double kUnitEpsilon = 1e-12;
 
 		double unwrapDegreesNear(double const reference, double const principal) noexcept {
 			double delta = std::fmod(principal - reference, 360.0);
@@ -34,15 +32,48 @@ namespace luastg {
 		void advanceGeneration(uint32_t& generation) noexcept {
 			++generation;
 
-			// 0 作为无效 handle 的默认 generation 值，避免有效 slot generation 变成 0。
 			if (generation == 0) {
 				++generation;
 			}
 		}
-    }
+	}
+
+	void UnitPool::addActiveIndex(uint32_t const index) {
+		auto& slot = m_slots[index];
+
+		if (slot.active_position != kInvalidActivePosition) {
+			return;
+		}
+
+		slot.active_position = static_cast<uint32_t>(m_active_indices.size());
+		m_active_indices.push_back(index);
+	}
+
+	void UnitPool::removeActiveIndex(uint32_t const index) noexcept {
+		if (index >= m_slots.size()) {
+			return;
+		}
+
+		auto& slot = m_slots[index];
+		auto const position = slot.active_position;
+
+		if (position == kInvalidActivePosition) {
+			return;
+		}
+
+		auto const last_index = m_active_indices.back();
+
+		m_active_indices[position] = last_index;
+		m_slots[last_index].active_position = position;
+
+		m_active_indices.pop_back();
+
+		slot.active_position = kInvalidActivePosition;
+	}
 
 	UnitHandle UnitPool::create() {
 		uint32_t index{};
+
 		if (!m_free_list.empty()) {
 			index = m_free_list.back();
 			m_free_list.pop_back();
@@ -58,6 +89,7 @@ namespace luastg {
 		}
 
 		auto& slot = m_slots[index];
+
 		slot.occupied = true;
 		slot.unit = Unit{};
 		slot.unit.id = index + 1;
@@ -65,29 +97,40 @@ namespace luastg {
 		slot.unit.alive = true;
 		slot.unit.born_frame = m_frame_epoch;
 
+		addActiveIndex(index);
+
 		++m_alive_count;
+
 		return UnitHandle{ slot.unit.id, slot.unit.generation };
 	}
-
 
 	bool UnitPool::destroy(UnitHandle const handle) noexcept {
 		if (handle.id == 0) {
 			return false;
 		}
+
 		auto const index = handle.id - 1;
+
 		if (index >= m_slots.size()) {
 			return false;
 		}
+
 		auto& slot = m_slots[index];
+
 		if (!slot.occupied || slot.generation != handle.generation || !slot.unit.alive) {
 			return false;
 		}
 
+		removeActiveIndex(index);
+
 		slot.unit.alive = false;
 		slot.occupied = false;
+
 		advanceGeneration(slot.generation);
+
 		m_free_list.push_back(index);
 		--m_alive_count;
+
 		return true;
 	}
 
@@ -95,14 +138,19 @@ namespace luastg {
 		if (handle.id == 0) {
 			return nullptr;
 		}
+
 		auto const index = handle.id - 1;
+
 		if (index >= m_slots.size()) {
 			return nullptr;
 		}
+
 		auto& slot = m_slots[index];
+
 		if (!slot.occupied || slot.generation != handle.generation || !slot.unit.alive) {
 			return nullptr;
 		}
+
 		return &slot.unit;
 	}
 
@@ -110,61 +158,76 @@ namespace luastg {
 		if (handle.id == 0) {
 			return nullptr;
 		}
+
 		auto const index = handle.id - 1;
+
 		if (index >= m_slots.size()) {
 			return nullptr;
 		}
+
 		auto const& slot = m_slots[index];
+
 		if (!slot.occupied || slot.generation != handle.generation || !slot.unit.alive) {
 			return nullptr;
 		}
+
 		return &slot.unit;
 	}
-
 
 	void UnitPool::beginFrame() noexcept {
 		++m_frame_epoch;
 		m_update_gate_epoch = m_frame_epoch;
 	}
 
-
 	void UnitPool::updateAll() noexcept {
-		for (auto& slot : m_slots) {
+		auto const active_count = m_active_indices.size();
+
+		for (size_t i = 0; i < active_count; ++i) {
+			auto const index = m_active_indices[i];
+
+			if (index >= m_slots.size()) {
+				continue;
+			}
+
+			auto& slot = m_slots[index];
+
 			if (!slot.occupied || !slot.unit.alive) {
 				continue;
 			}
 
 			auto& u = slot.unit;
 
-			// Aether 的帧语义：
-			// 本帧 Lua frame/task 中创建的 Unit，本帧不执行 native movement。
 			if (m_update_gate_epoch != 0 && u.born_frame == m_update_gate_epoch) {
 				continue;
 			}
 
 			u.vx += u.ax;
 			u.vy += u.ay;
+
 			syncUnitRotFromVelocity(u);
+
 			u.x += u.vx;
 			u.y += u.vy;
+
 			++u.timer;
 		}
 
-		// 避免外部直接调用 lstg.Unit.updateAll() 时长期残留 gate。
 		m_update_gate_epoch = 0;
 	}
 
-
-
 	void UnitPool::clear() noexcept {
 		m_free_list.clear();
+		m_active_indices.clear();
 
 		auto const slot_count = static_cast<uint32_t>(m_slots.size());
+
 		for (uint32_t i = 0; i < slot_count; ++i) {
 			auto& slot = m_slots[i];
 
 			slot.occupied = false;
 			slot.unit = Unit{};
+			slot.active_position = kInvalidActivePosition;
+
 			advanceGeneration(slot.generation);
 
 			m_free_list.push_back(i);
