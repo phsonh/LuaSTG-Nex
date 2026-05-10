@@ -103,6 +103,11 @@ namespace {
 		return 1;
 	}
 
+	int unit_begin_frame(lua_State* const vm) {
+		luastg::GetUnitPool().beginFrame();
+		return 0;
+	}
+
 	int unit_update_all(lua_State* const vm) {
 		luastg::GetUnitPool().updateAll();
 		return 0;
@@ -131,8 +136,31 @@ namespace {
 	}
 
 	int unit_index(lua_State* const vm) {
-		auto* unit = check_unit(vm, 1);
+		auto const ud = check_unit_userdata(vm, 1);
 		char const* key = luaL_checkstring(vm, 2);
+
+		// 这些方法即使 Unit 已经销毁，也应该能安全访问。
+		if (std::strcmp(key, "delete") == 0 || std::strcmp(key, "destroy") == 0) {
+			lua_pushcfunction(vm, unit_delete);
+			return 1;
+		}
+		if (std::strcmp(key, "isValid") == 0) {
+			lua_pushcfunction(vm, unit_is_valid);
+			return 1;
+		}
+
+		auto* unit = luastg::GetUnitPool().get(ud->handle);
+
+		// alive 是安全字段：销毁后返回 false，不抛错。
+		if (std::strcmp(key, "alive") == 0) {
+			lua_pushboolean(vm, unit != nullptr);
+			return 1;
+		}
+
+		if (!unit) {
+			luaL_error(vm, "invalid or destroyed lstg.Unit");
+			return 0;
+		}
 
 		if (std::strcmp(key, "id") == 0) {
 			lua_pushinteger(vm, static_cast<lua_Integer>(unit->id));
@@ -156,19 +184,11 @@ namespace {
 		if (std::strcmp(key, "ay") == 0) { lua_pushnumber(vm, unit->ay); return 1; }
 		if (std::strcmp(key, "rot") == 0) { lua_pushnumber(vm, unit->rot); return 1; }
 
-		// Methods exposed on instances.
-		if (std::strcmp(key, "delete") == 0 || std::strcmp(key, "destroy") == 0) {
-			lua_pushcfunction(vm, unit_delete);
-			return 1;
-		}
-		if (std::strcmp(key, "isValid") == 0) {
-			lua_pushcfunction(vm, unit_is_valid);
-			return 1;
-		}
-
 		lua_pushnil(vm);
 		return 1;
 	}
+		
+
 
 	int unit_newindex(lua_State* const vm) {
 		auto* unit = check_unit(vm, 1);
@@ -215,6 +235,7 @@ namespace luastg::binding {
 			{ "delete", &unit_delete },
 			{ "destroy", &unit_delete },
 			{ "isValid", &unit_is_valid },
+			{ "beginFrame", &unit_begin_frame },
 			{ "updateAll", &unit_update_all },
 			{ "clear", &unit_clear },
 			{ "count", &unit_count },

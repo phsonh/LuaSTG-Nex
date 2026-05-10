@@ -30,7 +30,17 @@ namespace luastg {
 			auto const principal = std::atan2(unit.vy, unit.vx) * kRadToDeg;
 			unit.rot = unwrapDegreesNear(unit.rot, principal);
 		}
+
+		void advanceGeneration(uint32_t& generation) noexcept {
+			++generation;
+
+			// 0 作为无效 handle 的默认 generation 值，避免有效 slot generation 变成 0。
+			if (generation == 0) {
+				++generation;
+			}
+		}
     }
+
 	UnitHandle UnitPool::create() {
 		uint32_t index{};
 		if (!m_free_list.empty()) {
@@ -53,9 +63,12 @@ namespace luastg {
 		slot.unit.id = index + 1;
 		slot.unit.generation = slot.generation;
 		slot.unit.alive = true;
+		slot.unit.born_frame = m_frame_epoch;
+
 		++m_alive_count;
 		return UnitHandle{ slot.unit.id, slot.unit.generation };
 	}
+
 
 	bool UnitPool::destroy(UnitHandle const handle) noexcept {
 		if (handle.id == 0) {
@@ -72,7 +85,7 @@ namespace luastg {
 
 		slot.unit.alive = false;
 		slot.occupied = false;
-		++slot.generation;
+		advanceGeneration(slot.generation);
 		m_free_list.push_back(index);
 		--m_alive_count;
 		return true;
@@ -108,12 +121,27 @@ namespace luastg {
 		return &slot.unit;
 	}
 
+
+	void UnitPool::beginFrame() noexcept {
+		++m_frame_epoch;
+		m_update_gate_epoch = m_frame_epoch;
+	}
+
+
 	void UnitPool::updateAll() noexcept {
 		for (auto& slot : m_slots) {
 			if (!slot.occupied || !slot.unit.alive) {
 				continue;
 			}
+
 			auto& u = slot.unit;
+
+			// Aether 的帧语义：
+			// 本帧 Lua frame/task 中创建的 Unit，本帧不执行 native movement。
+			if (m_update_gate_epoch != 0 && u.born_frame == m_update_gate_epoch) {
+				continue;
+			}
+
 			u.vx += u.ax;
 			u.vy += u.ay;
 			syncUnitRotFromVelocity(u);
@@ -121,12 +149,30 @@ namespace luastg {
 			u.y += u.vy;
 			++u.timer;
 		}
+
+		// 避免外部直接调用 lstg.Unit.updateAll() 时长期残留 gate。
+		m_update_gate_epoch = 0;
 	}
 
+
+
 	void UnitPool::clear() noexcept {
-		m_slots.clear();
 		m_free_list.clear();
+
+		auto const slot_count = static_cast<uint32_t>(m_slots.size());
+		for (uint32_t i = 0; i < slot_count; ++i) {
+			auto& slot = m_slots[i];
+
+			slot.occupied = false;
+			slot.unit = Unit{};
+			advanceGeneration(slot.generation);
+
+			m_free_list.push_back(i);
+		}
+
 		m_alive_count = 0;
+		m_frame_epoch = 0;
+		m_update_gate_epoch = 0;
 	}
 
 	size_t UnitPool::count() const noexcept {
