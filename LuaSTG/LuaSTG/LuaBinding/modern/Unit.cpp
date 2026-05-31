@@ -7,10 +7,10 @@
 namespace {
 
 	constexpr char const* kUnitMetatable = "lstg.Unit.instance";
-    constexpr double kPi = 3.141592653589793238462643383279502884;
-    constexpr double kDegToRad = kPi / 180.0;
-    constexpr double kRadToDeg = 180.0 / kPi;
-    constexpr double kUnitEpsilon = 1e-12;
+	constexpr double kPi = 3.141592653589793238462643383279502884;
+	constexpr double kDegToRad = kPi / 180.0;
+	constexpr double kRadToDeg = 180.0 / kPi;
+	constexpr double kUnitEpsilon = 1e-12;
 
 	double unwrap_degrees_near(double const reference, double const principal) noexcept {
 		double delta = std::fmod(principal - reference, 360.0);
@@ -25,8 +25,7 @@ namespace {
 		return reference + delta;
 	}
 
-
-    void sync_rot_from_velocity(luastg::Unit& unit) noexcept {
+	void sync_rot_from_velocity(luastg::Unit& unit) noexcept {
 		if ((unit.vx * unit.vx + unit.vy * unit.vy) <= kUnitEpsilon) {
 			return;
 		}
@@ -35,26 +34,24 @@ namespace {
 		unit.rot = unwrap_degrees_near(unit.rot, principal);
 	}
 
-    void set_velocity(luastg::Unit& unit, double const vx, double const vy) noexcept {
-        unit.vx = vx;
-        unit.vy = vy;
-        sync_rot_from_velocity(unit);
-    }
+	void set_velocity(luastg::Unit& unit, double const vx, double const vy) noexcept {
+		unit.vx = vx;
+		unit.vy = vy;
+		sync_rot_from_velocity(unit);
+	}
 
-    void set_rot_keep_speed(luastg::Unit& unit, double const rot) noexcept {
-        unit.rot = rot;
+	void set_rot_keep_speed(luastg::Unit& unit, double const rot) noexcept {
+		unit.rot = rot;
 
-        auto const speed = std::sqrt(unit.vx * unit.vx + unit.vy * unit.vy);
-        if (speed <= kUnitEpsilon) {
-            return;
-        }
+		auto const speed = std::sqrt(unit.vx * unit.vx + unit.vy * unit.vy);
+		if (speed <= kUnitEpsilon) {
+			return;
+		}
 
-        auto const rad = unit.rot * kDegToRad;
-        unit.vx = speed * std::cos(rad);
-        unit.vy = speed * std::sin(rad);
-    }
-	
-	
+		auto const rad = unit.rot * kDegToRad;
+		unit.vx = speed * std::cos(rad);
+		unit.vy = speed * std::sin(rad);
+	}
 
 	struct UnitUserData {
 		luastg::UnitHandle handle{};
@@ -67,22 +64,26 @@ namespace {
 	luastg::Unit* check_unit(lua_State* const vm, int const index) {
 		auto const ud = check_unit_userdata(vm, index);
 		auto* unit = luastg::GetUnitPool().get(ud->handle);
+
 		if (!unit) {
 			luaL_error(vm, "invalid or destroyed lstg.Unit");
 			return nullptr;
 		}
+
 		return unit;
 	}
 
 	void push_unit(lua_State* const vm, luastg::UnitHandle const handle) {
 		auto* ud = static_cast<UnitUserData*>(lua_newuserdata(vm, sizeof(UnitUserData)));
 		ud->handle = handle;
+
 		luaL_getmetatable(vm, kUnitMetatable);
 		lua_setmetatable(vm, -2);
 	}
 
 	int unit_new(lua_State* const vm) {
 		auto handle = luastg::GetUnitPool().create();
+
 		if (handle.id == 0) {
 			return luaL_error(vm, "UnitPool is full");
 		}
@@ -113,6 +114,39 @@ namespace {
 		return 0;
 	}
 
+	int unit_set_world_bounds(lua_State* const vm) {
+		auto const left = luaL_checknumber(vm, 1);
+		auto const right = luaL_checknumber(vm, 2);
+		auto const bottom = luaL_checknumber(vm, 3);
+		auto const top = luaL_checknumber(vm, 4);
+
+		luastg::GetUnitPool().setWorldBounds(left, right, bottom, top);
+
+		return 0;
+	}
+
+	int unit_consume_native_killed(lua_State* const vm) {
+		auto killed = luastg::GetUnitPool().consumeNativeKilled();
+
+		lua_createtable(vm, static_cast<int>(killed.size()), 0);
+
+		int index = 1;
+
+		for (auto const& handle : killed) {
+			lua_createtable(vm, 0, 2);
+
+			lua_pushinteger(vm, static_cast<lua_Integer>(handle.id));
+			lua_setfield(vm, -2, "id");
+
+			lua_pushinteger(vm, static_cast<lua_Integer>(handle.generation));
+			lua_setfield(vm, -2, "generation");
+
+			lua_rawseti(vm, -2, index++);
+		}
+
+		return 1;
+	}
+
 	int unit_clear(lua_State* const vm) {
 		luastg::GetUnitPool().clear();
 		return 0;
@@ -126,12 +160,14 @@ namespace {
 	int unit_tostring(lua_State* const vm) {
 		auto const ud = check_unit_userdata(vm, 1);
 		auto* unit = luastg::GetUnitPool().get(ud->handle);
+
 		if (!unit) {
 			lua_pushfstring(vm, "lstg.Unit<destroyed:%u:%u>", ud->handle.id, ud->handle.generation);
 		}
 		else {
 			lua_pushfstring(vm, "lstg.Unit<%u:%u>", unit->id, unit->generation);
 		}
+
 		return 1;
 	}
 
@@ -144,6 +180,7 @@ namespace {
 			lua_pushcfunction(vm, unit_delete);
 			return 1;
 		}
+
 		if (std::strcmp(key, "isValid") == 0) {
 			lua_pushcfunction(vm, unit_is_valid);
 			return 1;
@@ -166,6 +203,7 @@ namespace {
 			lua_pushinteger(vm, static_cast<lua_Integer>(unit->id));
 			return 1;
 		}
+
 		if (std::strcmp(key, "generation") == 0) {
 			lua_pushinteger(vm, static_cast<lua_Integer>(unit->generation));
 			return 1;
@@ -184,11 +222,14 @@ namespace {
 		if (std::strcmp(key, "ay") == 0) { lua_pushnumber(vm, unit->ay); return 1; }
 		if (std::strcmp(key, "rot") == 0) { lua_pushnumber(vm, unit->rot); return 1; }
 
+		if (std::strcmp(key, "bound") == 0) {
+			lua_pushboolean(vm, unit->bound);
+			return 1;
+		}
+
 		lua_pushnil(vm);
 		return 1;
 	}
-		
-
 
 	int unit_newindex(lua_State* const vm) {
 		auto* unit = check_unit(vm, 1);
@@ -202,9 +243,13 @@ namespace {
 		if (std::strcmp(key, "ay") == 0) { unit->ay = luaL_checknumber(vm, 3); return 0; }
 		if (std::strcmp(key, "rot") == 0) { set_rot_keep_speed(*unit, luaL_checknumber(vm, 3)); return 0; }
 
+		if (std::strcmp(key, "bound") == 0) {
+			unit->bound = lua_toboolean(vm, 3) != 0;
+			return 0;
+		}
+
 		return luaL_error(vm, "unknown or read-only lstg.Unit field '%s'", key);
 	}
-
 
 	int unit_set_velocity(lua_State* const vm) {
 		auto* unit = check_unit(vm, 1);
@@ -212,21 +257,61 @@ namespace {
 		return 0;
 	}
 
-
 	void create_unit_metatable(lua_State* const vm) {
 		if (luaL_newmetatable(vm, kUnitMetatable)) {
 			lua_pushcfunction(vm, unit_index);
 			lua_setfield(vm, -2, "__index");
+
 			lua_pushcfunction(vm, unit_newindex);
 			lua_setfield(vm, -2, "__newindex");
+
 			lua_pushcfunction(vm, unit_tostring);
 			lua_setfield(vm, -2, "__tostring");
 		}
+
 		lua_pop(vm, 1);
 	}
 }
 
 namespace luastg::binding {
+	bool Unit::testHandle(lua_State* const vm, int const index, luastg::UnitHandle& out) noexcept {
+		if (!lua_isuserdata(vm, index)) {
+			return false;
+		}
+
+		if (!lua_getmetatable(vm, index)) {
+			return false;
+		}
+
+		luaL_getmetatable(vm, kUnitMetatable);
+
+		bool const same_metatable = lua_rawequal(vm, -1, -2) != 0;
+
+		lua_pop(vm, 2);
+
+		if (!same_metatable) {
+			return false;
+		}
+
+		auto* ud = static_cast<UnitUserData*>(lua_touserdata(vm, index));
+
+		if (!ud) {
+			return false;
+		}
+
+		out = ud->handle;
+		return true;
+	}
+
+	bool Unit::checkHandle(lua_State* const vm, int const index, luastg::UnitHandle& out) {
+		if (!testHandle(vm, index, out)) {
+			luaL_error(vm, "lstg.Unit expected");
+			return false;
+		}
+
+		return true;
+	}
+
 	void Unit::registerClass(lua_State* const vm) {
 		create_unit_metatable(vm);
 
@@ -237,15 +322,17 @@ namespace luastg::binding {
 			{ "isValid", &unit_is_valid },
 			{ "beginFrame", &unit_begin_frame },
 			{ "updateAll", &unit_update_all },
+			{ "setWorldBounds", &unit_set_world_bounds },
+			{ "consumeNativeKilled", &unit_consume_native_killed },
 			{ "clear", &unit_clear },
 			{ "count", &unit_count },
 			{ nullptr, nullptr },
 		};
 
 		luaL_register(vm, LUASTG_LUA_LIBNAME ".Unit", unit_api); // ... lstg.Unit
-		luaL_register(vm, LUASTG_LUA_LIBNAME, nullptr); // ... lstg.Unit lstg
-		lua_pushvalue(vm, -2); // ... lstg.Unit lstg lstg.Unit
-		lua_setfield(vm, -2, "Unit"); // ... lstg.Unit lstg
+		luaL_register(vm, LUASTG_LUA_LIBNAME, nullptr);          // ... lstg.Unit lstg
+		lua_pushvalue(vm, -2);                                   // ... lstg.Unit lstg lstg.Unit
+		lua_setfield(vm, -2, "Unit");                            // ... lstg.Unit lstg
 		lua_pop(vm, 2);
 	}
 }

@@ -1,5 +1,6 @@
 #include "Unit/UnitPool.hpp"
 #include <cmath>
+#include <utility>
 
 namespace luastg {
 	namespace {
@@ -134,6 +135,35 @@ namespace luastg {
 		return true;
 	}
 
+	void UnitPool::destroySlotFromNative(uint32_t const index) noexcept {
+		if (index >= m_slots.size()) {
+			return;
+		}
+
+		auto& slot = m_slots[index];
+
+		if (!slot.occupied || !slot.unit.alive) {
+			return;
+		}
+
+		// 记录旧 handle。
+		// Lua UnitManager 用这个 handle 找 Lua wrapper，执行 Unit:del()，回收 Visual。
+		m_native_killed.push_back(UnitHandle{
+			slot.unit.id,
+			slot.unit.generation,
+		});
+
+		removeActiveIndex(index);
+
+		slot.unit.alive = false;
+		slot.occupied = false;
+
+		advanceGeneration(slot.generation);
+
+		m_free_list.push_back(index);
+		--m_alive_count;
+	}
+
 	Unit* UnitPool::get(UnitHandle const handle) noexcept {
 		if (handle.id == 0) {
 			return nullptr;
@@ -180,24 +210,27 @@ namespace luastg {
 	}
 
 	void UnitPool::updateAll() noexcept {
-		auto const active_count = m_active_indices.size();
+		size_t i = 0;
 
-		for (size_t i = 0; i < active_count; ++i) {
+		while (i < m_active_indices.size()) {
 			auto const index = m_active_indices[i];
 
 			if (index >= m_slots.size()) {
+				++i;
 				continue;
 			}
 
 			auto& slot = m_slots[index];
 
 			if (!slot.occupied || !slot.unit.alive) {
+				++i;
 				continue;
 			}
 
 			auto& u = slot.unit;
 
 			if (m_update_gate_epoch != 0 && u.born_frame == m_update_gate_epoch) {
+				++i;
 				continue;
 			}
 
@@ -210,6 +243,23 @@ namespace luastg {
 			u.y += u.vy;
 
 			++u.timer;
+
+			if (u.bound) {
+				if (
+					u.x < m_bound_left ||
+					u.x > m_bound_right ||
+					u.y < m_bound_bottom ||
+					u.y > m_bound_top
+				) {
+					destroySlotFromNative(index);
+
+					// removeActiveIndex 使用 swap-with-last。
+					// 当前 i 位置已经换入了另一个 active unit，所以这里不能 ++i。
+					continue;
+				}
+			}
+
+			++i;
 		}
 
 		m_update_gate_epoch = 0;
@@ -218,6 +268,7 @@ namespace luastg {
 	void UnitPool::clear() noexcept {
 		m_free_list.clear();
 		m_active_indices.clear();
+		m_native_killed.clear();
 
 		auto const slot_count = static_cast<uint32_t>(m_slots.size());
 
@@ -236,6 +287,24 @@ namespace luastg {
 		m_alive_count = 0;
 		m_frame_epoch = 0;
 		m_update_gate_epoch = 0;
+	}
+
+	void UnitPool::setWorldBounds(
+		double const left,
+		double const right,
+		double const bottom,
+		double const top
+	) noexcept {
+		m_bound_left = left;
+		m_bound_right = right;
+		m_bound_bottom = bottom;
+		m_bound_top = top;
+	}
+
+	std::vector<UnitHandle> UnitPool::consumeNativeKilled() {
+		auto result = std::move(m_native_killed);
+		m_native_killed.clear();
+		return result;
 	}
 
 	size_t UnitPool::count() const noexcept {

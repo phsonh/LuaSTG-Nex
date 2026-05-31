@@ -1,6 +1,15 @@
 #include "LuaBinding/LuaWrapper.hpp"
 #include "lua/plus.hpp"
 #include "LuaBinding/PostEffectShader.hpp"
+#include "LuaBinding/modern/Unit.hpp"
+#include "Unit/UnitPool.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+
 #include "LuaBinding/modern/Vector2.hpp"
 #include "LuaBinding/modern/Vector3.hpp"
 #include "LuaBinding/modern/Vector4.hpp"
@@ -501,6 +510,1364 @@ namespace luastg {
 			return 255;
 		}
 		return static_cast<uint8_t>(value);
+	}
+
+
+
+	constexpr char const* kSpriteComponentMetatable = "lstg.Renderer.SpriteComponent.instance";
+
+	struct SpriteComponentHandle {
+		uint32_t id{};
+		uint32_t generation{};
+	};
+
+	enum class SpriteOffsetMode : uint8_t {
+		Local,
+		World,
+	};
+
+	struct SpriteComponent {
+		uint32_t id{};
+		uint32_t generation{};
+		bool alive{};
+
+		bool visible{ true };
+		bool render_enabled{ false };
+
+		bool has_owner{};
+		luastg::UnitHandle owner{};
+
+		bool follow_position{ true };
+		bool follow_rotation{ true };
+
+		std::string sprite;
+		std::vector<std::string> frames;
+		uint32_t frame_interval{ 1 };
+		bool loop{ true };
+
+		double layer{};
+		double z{ 0.5 };
+
+		double x{};
+		double y{};
+
+		double offset_x{};
+		double offset_y{};
+		SpriteOffsetMode offset_mode{ SpriteOffsetMode::Local };
+
+		double local_rot{};
+		double rot_offset{};
+		double spin{};
+
+		double scale_x{ 1.0 };
+		double scale_y{ 1.0 };
+
+		BlendMode blend{ BlendMode::MulAlpha };
+
+		uint8_t a{ 255 };
+		uint8_t r{ 255 };
+		uint8_t g{ 255 };
+		uint8_t b{ 255 };
+
+		uint64_t timer{};
+	};
+
+	struct SpriteComponentUserData {
+		SpriteComponentHandle handle{};
+	};
+
+	class SpriteComponentPool {
+	public:
+		static constexpr size_t kDefaultMaxComponents = 65536;
+		static constexpr uint32_t kInvalidActivePosition = UINT32_MAX;
+		static constexpr uint32_t kInvalidUpdatePosition = UINT32_MAX;
+
+		SpriteComponentHandle create(luastg::UnitHandle const owner, bool const has_owner) {
+			uint32_t index{};
+
+			if (!m_free_list.empty()) {
+				index = m_free_list.back();
+				m_free_list.pop_back();
+			}
+			else {
+				if (m_slots.size() >= m_max_components) {
+					return {};
+				}
+
+				index = static_cast<uint32_t>(m_slots.size());
+				m_slots.emplace_back();
+				m_slots.back().generation = 1;
+				m_slots.back().active_position = kInvalidActivePosition;
+			}
+
+			auto& slot = m_slots[index];
+
+			slot.component = SpriteComponent{};
+			slot.component.id = index + 1;
+			slot.component.generation = slot.generation;
+			slot.component.alive = true;
+			slot.component.sprite = "img_void";
+			slot.component.owner = owner;
+			slot.component.has_owner = has_owner;
+
+			slot.active_position = static_cast<uint32_t>(m_active_indices.size());
+			m_active_indices.push_back(index);
+
+			++m_alive_count;
+
+			return SpriteComponentHandle{
+				slot.component.id,
+				slot.component.generation,
+			};
+		}
+
+		bool destroy(SpriteComponentHandle const handle) noexcept {
+			auto* component = get(handle);
+
+			if (!component) {
+				return false;
+			}
+
+			auto const index = handle.id - 1;
+			removeUpdateIndex(index);
+			removeActiveIndex(index);
+
+			auto& slot = m_slots[index];
+
+			slot.component.alive = false;
+			slot.component = SpriteComponent{};
+
+			advanceGeneration(slot.generation);
+
+			m_free_list.push_back(index);
+			--m_alive_count;
+
+			return true;
+		}
+
+		SpriteComponent* get(SpriteComponentHandle const handle) noexcept {
+			if (handle.id == 0) {
+				return nullptr;
+			}
+
+			auto const index = handle.id - 1;
+
+			if (index >= m_slots.size()) {
+				return nullptr;
+			}
+
+			auto& slot = m_slots[index];
+
+			if (slot.component.generation != handle.generation || !slot.component.alive) {
+				return nullptr;
+			}
+
+			return &slot.component;
+		}
+
+		SpriteComponent const* get(SpriteComponentHandle const handle) const noexcept {
+			if (handle.id == 0) {
+				return nullptr;
+			}
+
+			auto const index = handle.id - 1;
+
+			if (index >= m_slots.size()) {
+				return nullptr;
+			}
+
+			auto const& slot = m_slots[index];
+
+			if (slot.component.generation != handle.generation || !slot.component.alive) {
+				return nullptr;
+			}
+
+			return &slot.component;
+		}
+
+
+		void updateAll() noexcept {
+			for (auto const index : m_update_indices) {
+				if (index >= m_slots.size()) {
+					continue;
+				}
+
+				auto& c = m_slots[index].component;
+
+				if (!c.alive) {
+					continue;
+				}
+
+				if (c.spin != 0.0) {
+					c.local_rot += c.spin;
+				}
+
+				// timer 目前只服务 native frames。
+				// 没有 frames 的 component 不需要 native timer。
+				if (!c.frames.empty()) {
+					++c.timer;
+				}
+			}
+		}
+
+		void beginRenderFrame() noexcept {
+			// 这里稳定压缩 active list。
+			// 删除留下的洞会被移除，但剩余元素的相对顺序不变。
+			compactActiveIndicesStable();
+
+			for (auto const index : m_active_indices) {
+				if (index == kInvalidActivePosition || index >= m_slots.size()) {
+					continue;
+				}
+
+				auto& c = m_slots[index].component;
+
+				m_slots[index].component.render_enabled = false;
+			}
+		}
+
+		void renderLayerInternal(double const layer) {
+			size_t pos = 0;
+
+			while (pos < m_active_indices.size()) {
+				auto const index = m_active_indices[pos];
+
+				if (index == kInvalidActivePosition || index >= m_slots.size()) {
+					++pos;
+					continue;
+				}
+
+				auto const& c = m_slots[index].component;
+
+				if (!isRenderableInLayer(c, layer)) {
+					++pos;
+					continue;
+				}
+
+				pos = emitSpriteBatchRun(pos, layer);
+			}
+		}
+
+		void renderLayer(double const layer) {
+			compactActiveIndicesStable();
+			renderLayerInternal(layer);
+		}
+
+		void renderAll() {
+			compactActiveIndicesStable();
+
+			m_render_layers.clear();
+
+			for (auto const index : m_active_indices) {
+				if (index == kInvalidActivePosition || index >= m_slots.size()) {
+					continue;
+				}
+
+				auto const& c = m_slots[index].component;
+
+				if (!c.alive || !c.visible || !c.render_enabled) {
+					continue;
+				}
+
+				pushRenderLayer(c.layer);
+			}
+
+			if (m_render_layers.size() > 1) {
+				std::sort(m_render_layers.begin(), m_render_layers.end());
+			}
+
+			for (auto const layer : m_render_layers) {
+				renderLayerInternal(layer);
+			}
+		}
+
+		void clear() noexcept {
+			m_active_indices.clear();
+			m_update_indices.clear();
+			m_free_list.clear();
+			m_active_tombstone_count = 0;
+
+			auto const slot_count = static_cast<uint32_t>(m_slots.size());
+
+			for (uint32_t i = 0; i < slot_count; ++i) {
+				auto& slot = m_slots[i];
+
+				slot.component = SpriteComponent{};
+				slot.active_position = kInvalidActivePosition;
+				slot.update_position = kInvalidUpdatePosition;
+
+				advanceGeneration(slot.generation);
+
+				m_free_list.push_back(i);
+			}
+
+			m_alive_count = 0;
+		}
+
+		[[nodiscard]] size_t count() const noexcept {
+			return m_alive_count;
+		}
+
+	private:
+		struct Slot {
+			SpriteComponent component{};
+			uint32_t generation{ 1 };
+			uint32_t active_position{ kInvalidActivePosition };
+			uint32_t update_position{ kInvalidUpdatePosition };
+		};
+
+
+
+		struct SpriteBatchMaterial {
+			std::string sprite_name;
+			core::SmartReference<IResourceSprite> resource;
+			BlendMode blend{ BlendMode::MulAlpha };
+
+			core::Graphics::IRenderer::VertexColorBlendState vertex_color_blend_state{};
+			core::Graphics::IRenderer::BlendState blend_state{};
+		};
+
+
+		static void advanceGeneration(uint32_t& generation) noexcept {
+			++generation;
+
+			if (generation == 0) {
+				++generation;
+			}
+		}
+
+		void removeActiveIndex(uint32_t const index) noexcept {
+			if (index >= m_slots.size()) {
+				return;
+			}
+
+			auto& slot = m_slots[index];
+			auto const position = slot.active_position;
+
+			if (position == kInvalidActivePosition) {
+				return;
+			}
+
+			// 渲染顺序必须稳定：
+			// 不能把最后一个 active sprite 换到当前位置，
+			// 否则同 layer 内“后生成覆盖先生成”的顺序会被打乱。
+			if (position < m_active_indices.size() && m_active_indices[position] != kInvalidActivePosition) {
+				m_active_indices[position] = kInvalidActivePosition;
+				++m_active_tombstone_count;
+			}
+
+			slot.active_position = kInvalidActivePosition;
+		}
+
+		static bool componentNeedsUpdate(SpriteComponent const& c) noexcept {
+			return c.alive && (c.spin != 0.0 || !c.frames.empty());
+		}
+
+		void addUpdateIndex(uint32_t const index) {
+			if (index >= m_slots.size()) {
+				return;
+			}
+
+			auto& slot = m_slots[index];
+
+			if (slot.update_position != kInvalidUpdatePosition) {
+				return;
+			}
+
+			slot.update_position = static_cast<uint32_t>(m_update_indices.size());
+			m_update_indices.push_back(index);
+		}
+
+		void removeUpdateIndex(uint32_t const index) noexcept {
+			if (index >= m_slots.size()) {
+				return;
+			}
+
+			auto& slot = m_slots[index];
+			auto const position = slot.update_position;
+
+			if (position == kInvalidUpdatePosition) {
+				return;
+			}
+
+			auto const last_index = m_update_indices.back();
+
+			m_update_indices[position] = last_index;
+			m_slots[last_index].update_position = position;
+
+			m_update_indices.pop_back();
+
+			slot.update_position = kInvalidUpdatePosition;
+		}
+
+		void refreshUpdateIndex(uint32_t const index) {
+			if (index >= m_slots.size()) {
+				return;
+			}
+
+			auto const& c = m_slots[index].component;
+
+			if (componentNeedsUpdate(c)) {
+				addUpdateIndex(index);
+			}
+			else {
+				removeUpdateIndex(index);
+			}
+		}
+
+		public:
+		void refreshUpdateIndex(SpriteComponentHandle const handle) {
+			if (handle.id == 0) {
+				return;
+			}
+
+			auto const index = handle.id - 1;
+
+			if (index >= m_slots.size()) {
+				return;
+			}
+
+			auto const& slot = m_slots[index];
+
+			if (slot.component.generation != handle.generation || !slot.component.alive) {
+				return;
+			}
+
+			refreshUpdateIndex(index);
+		}
+		private:
+
+
+		void compactActiveIndicesStable() noexcept {
+			if (m_active_tombstone_count == 0) {
+				return;
+			}
+
+			size_t write = 0;
+
+			for (size_t read = 0; read < m_active_indices.size(); ++read) {
+				auto const index = m_active_indices[read];
+
+				if (index == kInvalidActivePosition) {
+					continue;
+				}
+
+				if (index >= m_slots.size()) {
+					continue;
+				}
+
+				auto& slot = m_slots[index];
+
+				if (!slot.component.alive) {
+					slot.active_position = kInvalidActivePosition;
+					continue;
+				}
+
+				m_active_indices[write] = index;
+				slot.active_position = static_cast<uint32_t>(write);
+				++write;
+			}
+
+			m_active_indices.resize(write);
+			m_active_tombstone_count = 0;
+		}
+
+		void pushRenderLayer(double const layer) {
+			for (auto const existing : m_render_layers) {
+				if (existing == layer) {
+					return;
+				}
+			}
+
+			m_render_layers.push_back(layer);
+		}
+
+		static char const* currentSpriteName(SpriteComponent const& c) noexcept {
+			if (!c.frames.empty()) {
+				auto const interval = std::max<uint32_t>(1, c.frame_interval);
+				auto frame_index = static_cast<size_t>(c.timer / interval);
+
+				if (c.loop) {
+					frame_index %= c.frames.size();
+				}
+				else if (frame_index >= c.frames.size()) {
+					frame_index = c.frames.size() - 1;
+				}
+
+				return c.frames[frame_index].c_str();
+			}
+
+			return c.sprite.c_str();
+		}
+
+
+		
+
+		static void rotateOffset(double& x, double& y, double const degrees) noexcept {
+			auto const rad = degrees * L_DEG_TO_RAD;
+			auto const sinv = std::sin(rad);
+			auto const cosv = std::cos(rad);
+
+			auto const tx = x * cosv - y * sinv;
+			auto const ty = x * sinv + y * cosv;
+
+			x = tx;
+			y = ty;
+		}
+
+
+		static constexpr size_t kMaxBatchQuads = 10000;
+
+		bool makeMaterial(SpriteComponent const& c, SpriteBatchMaterial& out) {
+			char const* sprite_name = currentSpriteName(c);
+
+			if (sprite_name == nullptr || sprite_name[0] == '\0') {
+				return false;
+			}
+
+			auto resource = LRESMGR().FindSprite(sprite_name);
+
+			if (!resource || resource->GetSprite() == nullptr || resource->GetSprite()->getTexture() == nullptr) {
+				return false;
+			}
+
+			auto const blend = translateLegacyBlendState(c.blend);
+
+			out.sprite_name = sprite_name;
+			out.resource = resource;
+			out.blend = c.blend;
+			out.vertex_color_blend_state = blend.vertex_color_blend_state;
+			out.blend_state = blend.blend_state;
+
+			return true;
+		}
+
+		bool isSameMaterial(SpriteComponent const& c, SpriteBatchMaterial const& material) {
+			if (c.blend != material.blend) {
+				return false;
+			}
+
+			char const* sprite_name = currentSpriteName(c);
+
+			if (sprite_name == nullptr) {
+				return false;
+			}
+
+			return material.sprite_name == sprite_name;
+		}
+
+		static void writeQuadVertices(
+			core::Graphics::IRenderer::DrawVertex* const vertices,
+			core::Graphics::IRenderer::DrawIndex* const indices,
+			uint16_t const index_offset,
+			size_t const quad_index,
+			SpriteComponent const& c,
+			IResourceSprite* const resource,
+			float const global_scale
+		) {
+			auto* sprite = resource->GetSprite();
+
+			auto const texture_rect = sprite->getTextureRect();
+			auto const texture_size = sprite->getTexture()->getSize();
+
+			auto const u_scale = 1.0f / static_cast<float>(texture_size.x);
+			auto const v_scale = 1.0f / static_cast<float>(texture_size.y);
+
+			float const u0 = texture_rect.a.x * u_scale;
+			float const v0 = texture_rect.a.y * v_scale;
+			float const u1 = texture_rect.b.x * u_scale;
+			float const v1 = texture_rect.b.y * v_scale;
+
+			auto const center = texture_rect.a + sprite->getTextureCenter();
+			auto const rect0 = texture_rect - center;
+
+			float const unit_scale = sprite->getUnitsPerPixel();
+
+			float const sx = static_cast<float>(c.scale_x * resource->GetScaleX() * global_scale);
+			float const sy = static_cast<float>(c.scale_y * resource->GetScaleY() * global_scale);
+
+			float x0 = rect0.a.x * unit_scale * sx;
+			float y0 = rect0.a.y * -unit_scale * sy;
+			float x1 = rect0.b.x * unit_scale * sx;
+			float y1 = rect0.b.y * -unit_scale * sy;
+
+			float px{};
+			float py{};
+			float rot_degree{};
+
+			resolveTransform(c, px, py, rot_degree);
+
+			float vx[4] = {
+				x0,
+				x1,
+				x1,
+				x0,
+			};
+
+			float vy[4] = {
+				y0,
+				y0,
+				y1,
+				y1,
+			};
+
+			float const rot = static_cast<float>(rot_degree * L_DEG_TO_RAD);
+
+			if (std::fabs(rot) > std::numeric_limits<float>::min()) {
+				float const sinv = std::sinf(rot);
+				float const cosv = std::cosf(rot);
+
+				for (int i = 0; i < 4; ++i) {
+					float const tx = vx[i] * cosv - vy[i] * sinv;
+					float const ty = vx[i] * sinv + vy[i] * cosv;
+
+					vx[i] = tx;
+					vy[i] = ty;
+				}
+			}
+
+			auto const color = core::Color4B(c.r, c.g, c.b, c.a).color();
+			float const z = static_cast<float>(c.z);
+
+			auto* v = vertices + quad_index * 4;
+
+			v[0].x = px + vx[0];
+			v[0].y = py + vy[0];
+			v[0].z = z;
+			v[0].u = u0;
+			v[0].v = v0;
+			v[0].color = color;
+
+			v[1].x = px + vx[1];
+			v[1].y = py + vy[1];
+			v[1].z = z;
+			v[1].u = u1;
+			v[1].v = v0;
+			v[1].color = color;
+
+			v[2].x = px + vx[2];
+			v[2].y = py + vy[2];
+			v[2].z = z;
+			v[2].u = u1;
+			v[2].v = v1;
+			v[2].color = color;
+
+			v[3].x = px + vx[3];
+			v[3].y = py + vy[3];
+			v[3].z = z;
+			v[3].u = u0;
+			v[3].v = v1;
+			v[3].color = color;
+
+			auto* idx = indices + quad_index * 6;
+
+			uint16_t const base = static_cast<uint16_t>(index_offset + quad_index * 4);
+
+			idx[0] = base + 0;
+			idx[1] = base + 1;
+			idx[2] = base + 2;
+			idx[3] = base + 2;
+			idx[4] = base + 3;
+			idx[5] = base + 0;
+		}
+
+		bool isRenderableInLayer(SpriteComponent const& c, double const layer) const noexcept {
+			return c.alive
+				&& c.visible
+				&& c.render_enabled
+				&& c.layer == layer;
+		}
+
+		size_t emitSpriteBatchRun(size_t const begin_pos, double const layer) {
+			if (begin_pos >= m_active_indices.size()) {
+				return begin_pos + 1;
+			}
+
+			auto const first_index = m_active_indices[begin_pos];
+
+			if (first_index == kInvalidActivePosition || first_index >= m_slots.size()) {
+				return begin_pos + 1;
+			}
+
+			auto const& first_component = m_slots[first_index].component;
+
+			if (!isRenderableInLayer(first_component, layer)) {
+				return begin_pos + 1;
+			}
+
+			SpriteBatchMaterial material;
+
+			if (!makeMaterial(first_component, material)) {
+				return begin_pos + 1;
+			}
+
+			size_t count = 0;
+			size_t end_pos = begin_pos;
+
+			for (size_t pos = begin_pos; pos < m_active_indices.size() && count < kMaxBatchQuads; ++pos) {
+				auto const index = m_active_indices[pos];
+
+				if (index == kInvalidActivePosition || index >= m_slots.size()) {
+					end_pos = pos + 1;
+					continue;
+				}
+
+				auto const& c = m_slots[index].component;
+
+				if (!isRenderableInLayer(c, layer)) {
+					end_pos = pos + 1;
+					continue;
+				}
+
+				if (!isSameMaterial(c, material)) {
+					break;
+				}
+
+				++count;
+				end_pos = pos + 1;
+			}
+
+			if (count == 0) {
+				return begin_pos + 1;
+			}
+
+			auto* renderer = LR2D();
+
+			renderer->setVertexColorBlendState(material.vertex_color_blend_state);
+			renderer->setBlendState(material.blend_state);
+			renderer->setTexture(material.resource->GetSprite()->getTexture());
+
+			core::Graphics::IRenderer::DrawVertex* vertices = nullptr;
+			core::Graphics::IRenderer::DrawIndex* indices = nullptr;
+			uint16_t index_offset = 0;
+
+			uint16_t const vertex_count = static_cast<uint16_t>(count * 4);
+			uint16_t const index_count = static_cast<uint16_t>(count * 6);
+
+			if (!renderer->drawRequest(vertex_count, index_count, &vertices, &indices, &index_offset)) {
+				// 保底：如果 drawRequest 失败，退回旧路径，至少不丢渲染。
+				for (size_t pos = begin_pos; pos < end_pos; ++pos) {
+					auto const index = m_active_indices[pos];
+
+					if (index == kInvalidActivePosition || index >= m_slots.size()) {
+						continue;
+					}
+
+					auto& c = m_slots[index].component;
+
+					if (!isRenderableInLayer(c, layer) || !isSameMaterial(c, material)) {
+						continue;
+					}
+
+					float x{};
+					float y{};
+					float rot{};
+
+					resolveTransform(c, x, y, rot);
+
+					core::Color4B const color(c.r, c.g, c.b, c.a);
+
+					api_drawSprite(
+						*material.resource,
+						x,
+						y,
+						static_cast<float>(rot * L_DEG_TO_RAD),
+						static_cast<float>(c.scale_x * LRESMGR().GetGlobalImageScaleFactor()),
+						static_cast<float>(c.scale_y * LRESMGR().GetGlobalImageScaleFactor()),
+						c.blend,
+						color,
+						static_cast<float>(c.z)
+					);
+				}
+
+				return end_pos;
+			}
+
+			float const global_scale = LRESMGR().GetGlobalImageScaleFactor();
+
+			size_t written = 0;
+
+			for (size_t pos = begin_pos; pos < end_pos && written < count; ++pos) {
+				auto const index = m_active_indices[pos];
+
+				if (index == kInvalidActivePosition || index >= m_slots.size()) {
+					continue;
+				}
+
+				auto const& c = m_slots[index].component;
+
+				if (!isRenderableInLayer(c, layer) || !isSameMaterial(c, material)) {
+					continue;
+				}
+
+				writeQuadVertices(
+					vertices,
+					indices,
+					index_offset,
+					written,
+					c,
+					*material.resource,
+					global_scale
+				);
+
+				++written;
+			}
+
+			return end_pos;
+		}
+
+		static void resolveTransform(SpriteComponent const& c, float& out_x, float& out_y, float& out_rot) noexcept {
+			double base_x = c.x;
+			double base_y = c.y;
+			double base_rot = 0.0;
+
+			luastg::Unit const* owner = nullptr;
+
+			if (c.has_owner) {
+				owner = luastg::GetUnitPool().get(c.owner);
+			}
+
+			if (owner) {
+				if (c.follow_position) {
+					base_x = owner->x;
+					base_y = owner->y;
+				}
+
+				if (c.follow_rotation) {
+					base_rot = owner->rot;
+				}
+			}
+
+			double ox = c.offset_x;
+			double oy = c.offset_y;
+
+			if (c.offset_mode == SpriteOffsetMode::Local && c.follow_rotation) {
+				rotateOffset(ox, oy, base_rot);
+			}
+
+			out_x = static_cast<float>(base_x + ox);
+			out_y = static_cast<float>(base_y + oy);
+			out_rot = static_cast<float>(base_rot + c.rot_offset + c.local_rot);
+		}
+
+		std::vector<Slot> m_slots;
+		std::vector<uint32_t> m_free_list;
+		std::vector<uint32_t> m_active_indices;
+		std::vector<uint32_t> m_update_indices;
+
+		// active_indices 中被删除后留下的空洞数量。
+		// 渲染顺序要求稳定，所以不能用 swap-with-last 删除。
+		size_t m_active_tombstone_count{};
+
+		// renderAll() 复用的 layer 缓存，避免每帧重复分配。
+		std::vector<double> m_render_layers;
+
+		size_t m_alive_count{};
+		size_t m_max_components{ kDefaultMaxComponents };
+	};
+
+	SpriteComponentPool& GetSpriteComponentPool() noexcept {
+		static SpriteComponentPool pool;
+		return pool;
+	}
+
+	SpriteComponentUserData* check_sprite_component_userdata(lua_State* const L, int const index) {
+		return static_cast<SpriteComponentUserData*>(
+			luaL_checkudata(L, index, kSpriteComponentMetatable)
+		);
+	}
+
+	SpriteComponent* check_sprite_component(lua_State* const L, int const index) {
+		auto const ud = check_sprite_component_userdata(L, index);
+		auto* component = GetSpriteComponentPool().get(ud->handle);
+
+		if (!component) {
+			luaL_error(L, "invalid or destroyed lstg.Renderer.SpriteComponent");
+			return nullptr;
+		}
+
+		return component;
+	}
+
+	void push_sprite_component(lua_State* const L, SpriteComponentHandle const handle) {
+		auto* ud = static_cast<SpriteComponentUserData*>(
+			lua_newuserdata(L, sizeof(SpriteComponentUserData))
+		);
+
+		ud->handle = handle;
+
+		luaL_getmetatable(L, kSpriteComponentMetatable);
+		lua_setmetatable(L, -2);
+	}
+
+	bool read_optional_unit_handle(lua_State* const L, int const index, luastg::UnitHandle& out) {
+		if (lua_isnoneornil(L, index)) {
+			out = {};
+			return false;
+		}
+
+		if (!luastg::binding::Unit::checkHandle(L, index, out)) {
+			out = {};
+			return false;
+		}
+
+		return true;
+	}
+
+	BlendMode optional_blend(lua_State* const L, int const index) {
+		if (lua_isnoneornil(L, index)) {
+			return BlendMode::MulAlpha;
+		}
+
+		return TranslateBlendMode(L, index);
+	}
+
+	static int sprite_component_new(lua_State* L) {
+		luastg::UnitHandle owner{};
+		bool const has_owner = read_optional_unit_handle(L, 1, owner);
+
+		auto const handle = GetSpriteComponentPool().create(owner, has_owner);
+
+		if (handle.id == 0) {
+			return luaL_error(L, "SpriteComponentPool is full");
+		}
+
+		push_sprite_component(L, handle);
+		return 1;
+	}
+
+	static int sprite_component_delete(lua_State* L) {
+		auto const ud = check_sprite_component_userdata(L, 1);
+		lua_pushboolean(L, GetSpriteComponentPool().destroy(ud->handle));
+		return 1;
+	}
+
+	static int sprite_component_is_valid(lua_State* L) {
+		auto const ud = check_sprite_component_userdata(L, 1);
+		lua_pushboolean(L, GetSpriteComponentPool().get(ud->handle) != nullptr);
+		return 1;
+	}
+
+	static int sprite_component_set_owner(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		luastg::UnitHandle owner{};
+		bool const has_owner = read_optional_unit_handle(L, 2, owner);
+
+		c->owner = owner;
+		c->has_owner = has_owner;
+
+		return 0;
+	}
+
+	static int sprite_component_clear_owner(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->owner = {};
+		c->has_owner = false;
+
+		return 0;
+	}
+
+	static int sprite_component_set_sprite(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->sprite = luaL_checkstring(L, 2);
+		c->frames.clear();
+
+		auto const ud = check_sprite_component_userdata(L, 1);
+		GetSpriteComponentPool().refreshUpdateIndex(ud->handle);
+
+		return 0;
+	}
+
+	static int sprite_component_set_frames(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->frames.clear();
+
+		if (lua_isnoneornil(L, 2)) {
+			return 0;
+		}
+
+		luaL_checktype(L, 2, LUA_TTABLE);
+
+		auto const count = static_cast<int>(lua_objlen(L, 2));
+
+		c->frames.reserve(static_cast<size_t>(count));
+
+		for (int i = 1; i <= count; ++i) {
+			lua_rawgeti(L, 2, i);
+
+			if (!lua_isnil(L, -1)) {
+				c->frames.emplace_back(luaL_checkstring(L, -1));
+			}
+
+			lua_pop(L, 1);
+		}
+
+		c->timer = 0;
+
+		auto const ud = check_sprite_component_userdata(L, 1);
+		GetSpriteComponentPool().refreshUpdateIndex(ud->handle);
+
+		return 0;
+	}
+
+	static int sprite_component_set_frame_interval(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		auto interval = static_cast<uint32_t>(std::max<lua_Integer>(1, luaL_checkinteger(L, 2)));
+		c->frame_interval = interval;
+
+		return 0;
+	}
+
+	static int sprite_component_set_loop(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->loop = lua_toboolean(L, 2) != 0;
+
+		return 0;
+	}
+
+	static int sprite_component_reset_timer(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->timer = static_cast<uint64_t>(std::max<lua_Integer>(0, luaL_optinteger(L, 2, 0)));
+
+		return 0;
+	}
+
+	static int sprite_component_set_visible(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->visible = lua_toboolean(L, 2) != 0;
+
+		return 0;
+	}
+
+	static int sprite_component_set_render_enabled(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->render_enabled = lua_toboolean(L, 2) != 0;
+
+		return 0;
+	}
+
+	static int sprite_component_set_layer(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->layer = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_z(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->z = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_blend(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->blend = optional_blend(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_follow_master(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		bool const value = lua_toboolean(L, 2) != 0;
+
+		c->follow_position = value;
+		c->follow_rotation = value;
+
+		return 0;
+	}
+
+	static int sprite_component_follow_position(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->follow_position = lua_toboolean(L, 2) != 0;
+
+		return 0;
+	}
+
+	static int sprite_component_follow_rotation(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->follow_rotation = lua_toboolean(L, 2) != 0;
+
+		return 0;
+	}
+
+	static int sprite_component_set_position(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->x = luaL_checknumber(L, 2);
+		c->y = luaL_checknumber(L, 3);
+
+		return 0;
+	}
+
+	static int sprite_component_set_x(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->x = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_y(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->y = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_offset(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->offset_x = luaL_checknumber(L, 2);
+		c->offset_y = luaL_checknumber(L, 3);
+
+		return 0;
+	}
+
+	static int sprite_component_set_offset_mode(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		char const* mode = luaL_checkstring(L, 2);
+
+		if (std::strcmp(mode, "local") == 0) {
+			c->offset_mode = SpriteOffsetMode::Local;
+		}
+		else if (std::strcmp(mode, "world") == 0) {
+			c->offset_mode = SpriteOffsetMode::World;
+		}
+		else {
+			return luaL_error(L, "offset mode must be 'local' or 'world'");
+		}
+
+		return 0;
+	}
+
+	static int sprite_component_set_local_rot(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->local_rot = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_rot_offset(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->rot_offset = luaL_checknumber(L, 2);
+
+		return 0;
+	}
+
+	static int sprite_component_set_spin(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->spin = luaL_checknumber(L, 2);
+
+		auto const ud = check_sprite_component_userdata(L, 1);
+		GetSpriteComponentPool().refreshUpdateIndex(ud->handle);
+
+		return 0;
+	}
+
+	static int sprite_component_set_scale(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->scale_x = luaL_checknumber(L, 2);
+		c->scale_y = c->scale_x;
+
+		return 0;
+	}
+
+	static int sprite_component_set_scale_xy(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->scale_x = luaL_checknumber(L, 2);
+		c->scale_y = luaL_checknumber(L, 3);
+
+		return 0;
+	}
+
+	static int sprite_component_set_alpha(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->a = clamp_u8(luaL_checknumber(L, 2));
+
+		return 0;
+	}
+
+	static int sprite_component_set_color(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->r = clamp_u8(luaL_checknumber(L, 2));
+		c->g = clamp_u8(luaL_checknumber(L, 3));
+		c->b = clamp_u8(luaL_checknumber(L, 4));
+
+		return 0;
+	}
+
+	static int sprite_component_set_rgba(lua_State* L) {
+		auto* c = check_sprite_component(L, 1);
+
+		c->r = clamp_u8(luaL_checknumber(L, 2));
+		c->g = clamp_u8(luaL_checknumber(L, 3));
+		c->b = clamp_u8(luaL_checknumber(L, 4));
+		c->a = clamp_u8(luaL_checknumber(L, 5));
+
+		return 0;
+	}
+
+	static int sprite_component_update_all(lua_State* L) {
+		GetSpriteComponentPool().updateAll();
+		return 0;
+	}
+
+	static int sprite_component_begin_render_frame(lua_State* L) {
+		GetSpriteComponentPool().beginRenderFrame();
+		return 0;
+	}
+
+	static int sprite_component_render_layer(lua_State* L) {
+		validate_render_scope();
+
+		GetSpriteComponentPool().renderLayer(luaL_checknumber(L, 1));
+
+		return 0;
+	}
+
+	static int sprite_component_render_all(lua_State* L) {
+		validate_render_scope();
+
+		GetSpriteComponentPool().renderAll();
+
+		return 0;
+	}
+
+
+	static int sprite_component_clear(lua_State* L) {
+		GetSpriteComponentPool().clear();
+		return 0;
+	}
+
+	static int sprite_component_count(lua_State* L) {
+		lua_pushinteger(L, static_cast<lua_Integer>(GetSpriteComponentPool().count()));
+		return 1;
+	}
+
+	static int sprite_component_gc(lua_State* L) {
+		auto const ud = check_sprite_component_userdata(L, 1);
+
+		GetSpriteComponentPool().destroy(ud->handle);
+
+		return 0;
+	}
+
+	static int sprite_component_tostring(lua_State* L) {
+		auto const ud = check_sprite_component_userdata(L, 1);
+		auto* c = GetSpriteComponentPool().get(ud->handle);
+
+		if (c) {
+			lua_pushfstring(L, "lstg.Renderer.SpriteComponent<%u:%u>", c->id, c->generation);
+		}
+		else {
+			lua_pushfstring(L, "lstg.Renderer.SpriteComponent<destroyed:%u:%u>", ud->handle.id, ud->handle.generation);
+		}
+
+		return 1;
+	}
+
+	static void register_sprite_component(lua_State* L) {
+		luaL_Reg const methods[] = {
+			{ "delete", &sprite_component_delete },
+			{ "destroy", &sprite_component_delete },
+			{ "isValid", &sprite_component_is_valid },
+
+			{ "setOwner", &sprite_component_set_owner },
+			{ "clearOwner", &sprite_component_clear_owner },
+
+			{ "setSprite", &sprite_component_set_sprite },
+			{ "setImage", &sprite_component_set_sprite },
+			{ "setFrames", &sprite_component_set_frames },
+			{ "setFrameInterval", &sprite_component_set_frame_interval },
+			{ "setLoop", &sprite_component_set_loop },
+			{ "resetTimer", &sprite_component_reset_timer },
+
+			{ "setVisible", &sprite_component_set_visible },
+			{ "setRenderEnabled", &sprite_component_set_render_enabled },
+
+			{ "setLayer", &sprite_component_set_layer },
+			{ "setZ", &sprite_component_set_z },
+			{ "setBlend", &sprite_component_set_blend },
+
+			{ "followMaster", &sprite_component_follow_master },
+			{ "followPosition", &sprite_component_follow_position },
+			{ "followRotation", &sprite_component_follow_rotation },
+
+			{ "setPosition", &sprite_component_set_position },
+			{ "setX", &sprite_component_set_x },
+			{ "setY", &sprite_component_set_y },
+			{ "setOffset", &sprite_component_set_offset },
+			{ "setOffsetMode", &sprite_component_set_offset_mode },
+
+			{ "setLocalRot", &sprite_component_set_local_rot },
+			{ "setRotOffset", &sprite_component_set_rot_offset },
+			{ "setSpin", &sprite_component_set_spin },
+
+			{ "setScale", &sprite_component_set_scale },
+			{ "setScaleXY", &sprite_component_set_scale_xy },
+
+			{ "setAlpha", &sprite_component_set_alpha },
+			{ "setColor", &sprite_component_set_color },
+			{ "setRGBA", &sprite_component_set_rgba },
+
+			{ nullptr, nullptr },
+		};
+
+		luaL_Reg const metamethods[] = {
+			{ "__gc", &sprite_component_gc },
+			{ "__tostring", &sprite_component_tostring },
+			{ nullptr, nullptr },
+		};
+
+		if (luaL_newmetatable(L, kSpriteComponentMetatable)) {
+			luaL_register(L, nullptr, metamethods);
+
+			lua_newtable(L);
+			luaL_register(L, nullptr, methods);
+			lua_setfield(L, -2, "__index");
+		}
+
+		lua_pop(L, 1);
+
+		luaL_Reg const api[] = {
+			{ "new", &sprite_component_new },
+			{ "updateAll", &sprite_component_update_all },
+			{ "beginRenderFrame", &sprite_component_begin_render_frame },
+			{ "renderLayer", &sprite_component_render_layer },
+			{ "renderAll", &sprite_component_render_all },
+			{ "clear", &sprite_component_clear },
+			{ "count", &sprite_component_count },
+			{ nullptr, nullptr },
+		};
+
+		lua_newtable(L);
+		luaL_register(L, nullptr, api);
+		lua_setfield(L, -2, "SpriteComponent");
 	}
 
 	static int lib_Sprite(lua_State* L) {
@@ -1054,8 +2421,11 @@ namespace luastg {
 }
 
 void luastg::binding::Renderer::Register(lua_State* L)noexcept {
-	luaL_register(L, LUASTG_LUA_LIBNAME, lib_compat);           // ??? lstg
-	luaL_register(L, LUASTG_LUA_LIBNAME ".Renderer", lib_func); // ??? lstg lstg.Renderer
-	lua_setfield(L, -1, "Renderer");                            // ??? lstg
-	lua_pop(L, 1);                                              // ???
+	luaL_register(L, LUASTG_LUA_LIBNAME, lib_compat);           // ... lstg
+	luaL_register(L, LUASTG_LUA_LIBNAME ".Renderer", lib_func); // ... lstg lstg.Renderer
+
+	register_sprite_component(L);                              // ... lstg lstg.Renderer
+
+	lua_setfield(L, -1, "Renderer");                            // ... lstg
+	lua_pop(L, 1);                                              // ...
 }
